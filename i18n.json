@@ -363,6 +363,10 @@
     "en": "Native Modules",
     "zh": "原生模块"
   },
+  "guide.custom.napi.addon": {
+    "en": "NAPI Addon",
+    "zh": "NAPI 插件"
+  },
   "guide.custom.native.component": {
     "en": "Custom Native Element",
     "zh": "自定义元件"

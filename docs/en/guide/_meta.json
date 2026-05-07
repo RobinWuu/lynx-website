@@ -77,6 +77,11 @@
     "label": "guide.custom.native.modules"
   },
   {
+    "type": "file",
+    "name": "lynx-napi-addon",
+    "label": "guide.custom.napi.addon"
+  },
+  {
     "type": "dir",
     "name": "custom-native-component",
     "label": "guide.custom.native.component",

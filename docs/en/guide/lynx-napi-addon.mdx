@@ -1,0 +1,477 @@
+import { PlatformTabs } from '@lynx';
+
+# Node-API Addon (NAPI Addon)
+
+This document explains how to integrate Lynx Node-API addons (NAPI addons) into a host app, including host-side integration, how to develop a new addon, and how to call it from the frontend (BTS).
+
+:::info Scope
+This is an **experimental capability**. This document uses Lynx/PrimJS 3.9.x as the baseline. The sample implementation follows the default convention used by the open-source Explorer: loading is triggered by `requireNodeAddon(addonName)`, and the exports are published to `globalThis.__lynx_node_addon_exports__`.
+:::
+
+:::tip Read these docs first
+- Basic Native Modules concepts and the JS ↔ Native bridge: [Native Modules](/guide/use-native-modules)
+- Lynx's dual-thread scripting model (BTS/MTS): [JavaScript Runtime](/guide/scripting-runtime)
+:::
+
+## 1. Concepts and overall flow
+
+In Lynx, a Node-API addon is essentially a dynamically loaded library shipped with the app package (`.so` on Android/Harmony, `.framework`/`.xcframework` on iOS/macOS). At runtime, the host app:
+
+1. Obtains the `napi_env` for the page from the runtime attach callback.
+2. When the page calls `requireNodeAddon(addonName)`, the host-side loader uses `dlopen` to load the dynamic library, locates `napi_register_module_v1`, and calls it to initialize the exports.
+3. Publishes the exports to JS (sample convention: `globalThis.__lynx_node_addon_exports__[addonName]`).
+
+:::info Why bind `napi_env`
+`napi_env` is bound to a specific JS runtime instance. Reusing the wrong env across pages or runtimes usually results in crashes or nondeterministic behavior.
+:::
+
+## 2. Integrate into the host app
+
+This section is for **host app developers**. The goal is to let a Lynx page load and call a NAPI addon from BTS.
+
+### 2.1 Prerequisites
+
+- Lynx SDK: 3.9.x (or a later backward-compatible version)
+- Platform runtime dependencies:
+  - Android / Harmony: integrate PrimJS 3.9.x and ensure `libnapi_adapter.so` is shipped with the app package
+  - iOS: integrate PrimJS 3.9.x and include `LynxWeakNodeAPI`; you also need to install the PrimJS ↔ `LynxWeakNodeAPI` bridge once during app startup
+
+### 2.2 The three pieces you need
+
+1. **Module boundary**: expose a Native Module to Lynx (sample module name: `LynxNodeAPI`) and provide a `requireNodeAddon(addonName)` method.
+
+2. **Env lifecycle binding**: store `napi_env` on runtime attach and clean it up on runtime detach.
+
+3. **Addon loader**: locate the dynamic library by `addonName`, then `dlopen` → `dlsym("napi_register_module_v1")` → initialize exports → publish to JS.
+
+### 2.3 Package the addon into the app
+
+<PlatformTabs queryKey="platform">
+  <PlatformTabs.Tab platform="android">
+
+On Android, package the addon as `lib<addon>.so` under `jni/<abi>/`.
+
+- Release: package `jni/<abi>/lib<addon>.so` into an AAR so the host only needs to depend on the AAR.
+- Local debugging: place `lib<addon>.so` in a directory covered by `jniLibs.srcDirs`.
+
+:::tip ABI alignment
+If your addon only provides a subset of ABIs, such as `arm64-v8a` only, make sure the host app ABI configuration matches it. Otherwise the app may build successfully but fail to find the library at runtime.
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="ios">
+
+On iOS, package the addon as an `xcframework` and integrate it with a CocoaPods `podspec`, so link/embed/sign can be handled automatically.
+
+:::info Required startup bridge on iOS
+Install the PrimJS ↔ `LynxWeakNodeAPI` bridge during app startup, once only. Otherwise the addon may still fail to load or behave unexpectedly even if it is packaged correctly.
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="harmony">
+
+On HarmonyOS, package `lib<addon>.so` into the application through a `har` package.
+
+:::tip Why the sample uses a Sendable Module
+On HarmonyOS, the default threading semantics of native modules are not fully aligned with BTS. The Explorer sample uses a sendable module plus token passing so addon calls and callbacks run with the expected threading semantics.
+:::
+
+  </PlatformTabs.Tab>
+</PlatformTabs>
+
+### 2.4 Platform integration examples
+
+The following snippets only illustrate how the key pieces fit together: register the module, bind `napi_env`, and call the native loader. You can implement the same flow using the structure and languages of your own app.
+
+<PlatformTabs queryKey="platform">
+  <PlatformTabs.Tab platform="android">
+
+#### Register the module and bind `napi_env`
+
+```java title="YourApplication.java"
+@Override
+public void onCreate() {
+  super.onCreate();
+  LynxEnv.inst().registerModule("LynxNodeAPI", LynxNodeAPIModule.class);
+}
+```
+
+```java title="LynxPageActivity.java"
+lynxView.addRuntimeLifecycleListener(new RuntimeLifecycleListener() {
+  @Override
+  public void onRuntimeAttach(long napiEnv) {
+    LynxNodeAPIModule.putEnv(lynxView.getLynxContext(), napiEnv);
+  }
+
+  @Override
+  public void onRuntimeDetach() {
+    LynxNodeAPIModule.removeEnv(lynxView.getLynxContext());
+  }
+});
+```
+
+#### Module method: forward to the native loader
+
+```java title="LynxNodeAPIModule.java"
+public class LynxNodeAPIModule extends LynxContextModule {
+  static {
+    System.loadLibrary("lynx_napi_addon_loader");
+  }
+
+  @LynxMethod
+  public void requireNodeAddon(String addonName) {
+    long env = getEnv(getLynxContext());
+    nativeRequireNodeAddon(env, addonName);
+  }
+
+  private static native void nativeRequireNodeAddon(long env, String addonName);
+}
+```
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="ios">
+
+#### Install the bridge at startup
+
+```objective-c title="AppDelegate.m"
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+  InstallPrimJSWeakNodeApiBridge();
+  return YES;
+}
+```
+
+#### Bind `napi_env` on attach/detach
+
+```objective-c title="LynxViewController.m"
+BOOL enableNapiAddon = IsTruthyParam(self.params[@"enable_napi_addon"]);
+if (enableNapiAddon) {
+  self.backgroundRuntime = [[LynxBackgroundRuntime alloc] init];
+  [self.backgroundRuntime addRuntimeLifecycleListener:[[LynxNodeAPILifecycleListener alloc] initWithToken:self]];
+  builder.lynxBackgroundRuntime = self.backgroundRuntime;
+}
+
+[builder.config registerModule:LynxNodeAPIModule.class param:self];
+```
+
+#### Module method: call the shared loader
+
+```objective-c title="LynxNodeAPIModule.mm"
++ (NSString *)name { return @"LynxNodeAPI"; }
+
+- (void)requireNodeAddon:(NSString *)addonName {
+  void *napiEnv = [LynxNodeAPIModule envForToken:self.token];
+  lynx::explorer::LynxNodeAPI::GetInstance().RequireNodeAddon(napiEnv, addonName.UTF8String);
+}
+```
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="harmony">
+
+#### Sendable module + token passing
+
+```typescript title="LynxNodeAPIModule.ets"
+export class LynxNodeAPIModule extends SendableLynxModule {
+  constructor(param?: LynxNodeAPIToken) {
+    super();
+    this.token = param;
+  }
+
+  public requireNodeAddon(addonName: string): void {
+    // Call the native NAPI glue: requireNodeAddonByToken(token.id, addonName)
+  }
+}
+```
+
+```typescript title="LynxPage.ets"
+if (enableNapiAddon) {
+  this.backgroundRuntime = new LynxBackgroundRuntime();
+  this.backgroundRuntime.addRuntimeLifecycleListener(new LynxNodeAPILifecycleListener(this.nodeAPIToken));
+}
+```
+
+:::info Why a token is needed
+In the HarmonyOS sample, `napi_env` is bound to a page token ID, and the native loader retrieves the corresponding env by token ID when called. This preserves the expected threading and lifecycle semantics.
+:::
+
+  </PlatformTabs.Tab>
+</PlatformTabs>
+
+### 2.5 Host module interface contract
+
+On the JS side, you typically want a `NativeModules.LynxNodeAPI.requireNodeAddon()`:
+
+```typescript title="typings.d.ts"
+declare global {
+  var NativeModules: {
+    LynxNodeAPI?: {
+      requireNodeAddon(addonName: string): void;
+    };
+  };
+}
+```
+
+### 2.6 Recommended structure for env binding and the loader
+
+On the host side, we recommend splitting the implementation into two layers:
+
+- Platform layer (Java / ObjC / ETS): register the module, receive runtime attach/detach callbacks, and forward `napi_env` to native code.
+- Shared C/C++ loader: handle `dlopen`/`dlsym` and publish exports.
+
+Below is sample-level loader pseudocode. It is only one possible implementation:
+
+```cpp title="LynxNodeAPI.cc"
+#include <dlfcn.h>
+#include <node_api.h>
+
+using RegisterFn = napi_value (*)(napi_env env, napi_value exports);
+
+void RequireNodeAddon(void* env_ptr, const char* addon_name) {
+  napi_env env = reinterpret_cast<napi_env>(env_ptr);
+
+  void* handle = dlopen(BuildLibraryName(addon_name), RTLD_NOW);
+  if (!handle) {
+    ThrowOrReport("dlopen failed");
+    return;
+  }
+
+  auto init = reinterpret_cast<RegisterFn>(dlsym(handle, "napi_register_module_v1"));
+  if (!init) {
+    ThrowOrReport("napi_register_module_v1 not found");
+    return;
+  }
+
+  napi_value exports;
+  napi_create_object(env, &exports);
+  exports = init(env, exports);
+
+  PublishToGlobal(env, addon_name, exports); // __lynx_node_addon_exports__[addon_name] = exports
+}
+```
+
+:::info Customizable parts
+The module name, method name, export table location, library name resolution, and search path are all host-defined. This document only describes one default convention used in the open-source sample so you can get up and running quickly.
+:::
+
+### 2.7 Minimal self-checklist
+
+- `NativeModules.LynxNodeAPI.requireNodeAddon` exists and is callable
+- The runtime attach callback receives `napi_env`, and detach cleans it up
+- The addon dynamic library is packaged correctly, and the ABI matches the host configuration
+- The addon exports `napi_register_module_v1`, otherwise the loader will fail
+
+## 3. Develop a new addon
+
+This section is for **addon authors**. We recommend creating the project with the `@lynx-js/weak-node-api` scaffold and building cross-platform artifacts with CMake.
+
+### 3.1 Requirements
+
+- Node.js: 18+
+- CMake: 3.20+ recommended
+- Android: install the NDK and set the `ANDROID_NDK` environment variable
+- HarmonyOS: install the OHOS NDK and set the `OHOS_NDK` environment variable
+- iOS/macOS: install Xcode for `-G Xcode` and `xcodebuild`
+
+### 3.2 Create the project
+
+```bash
+npm exec -y -p @lynx-js/weak-node-api create-weak-node-api
+```
+
+The scaffold generates a buildable project out of the box. Key files include:
+
+- `src/addon.cc`: sample addon implementation, including the standard registration entry
+- `CMakeLists.txt`: outputs platform artifacts into `dist/`
+- `scripts/fetch-libs.mjs`: downloads and extracts `libnapi_adapter.so` for Android/Harmony
+- `scripts/package-apple.mjs`: packages Apple artifacts into an `xcframework` and generates a `podspec`
+
+### 3.3 Implement the addon
+
+The open-source sample loader finds `napi_register_module_v1` through `dlsym` and calls it to initialize exports. Therefore the addon must use the standard Node-API registration macros so that symbol is visible.
+
+```cpp title="src/addon.cc"
+#include <node_api.h>
+
+static napi_value Init(napi_env env, napi_value exports) {
+  // TODO: attach methods or objects to exports
+  return exports;
+}
+
+NAPI_MODULE_INIT() { return Init(env, exports); }
+```
+
+### 3.4 Build outputs in `dist/`
+
+After the build completes, artifacts are output to `dist/` by platform:
+
+- Android: `dist/android/<abi>/lib<project>.so`
+- HarmonyOS: `dist/harmony/<abi>/lib<project>.so`
+- iOS: `dist/ios/iphoneos/<project>.framework` and `dist/ios/iphonesimulator/<project>.framework`
+- macOS: `dist/macos/macosx/<project>.framework`
+
+<PlatformTabs queryKey="platform">
+  <PlatformTabs.Tab platform="android">
+
+```bash title="build android (arm64-v8a)"
+npm install
+cmake -S . -B build-android-arm64 \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-21 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-android-arm64
+```
+
+:::tip Build-time dependency
+The Android build automatically runs a script that downloads the PrimJS AAR and extracts `libnapi_adapter.so` into `vendor/android/` for linking.
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="harmony">
+
+```bash title="build harmony (arm64)"
+npm install
+cmake -S . -B build-ohos-arm64 \
+  -DCMAKE_TOOLCHAIN_FILE=$OHOS_NDK/build/cmake/ohos.toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-ohos-arm64
+```
+
+:::info Weak suffix is enabled by default on Harmony
+HarmonyOS enables `USE_WEAK_SUFFIX_NAPI` by default and extracts `libnapi_adapter.so` from the HAR into `vendor/harmony/`.
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="ios">
+
+```bash title="build ios (device slice)"
+npm install
+cmake -S . -B build-ios-arm64 \
+  -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build build-ios-arm64 --config Release
+```
+
+For the iOS simulator build, change `-DCMAKE_OSX_SYSROOT` to `iphonesimulator` and choose an appropriate `-DCMAKE_OSX_ARCHITECTURES` value.
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="web">
+
+This document does not cover NAPI addons on Web, where `dlopen` is typically unavailable.
+
+  </PlatformTabs.Tab>
+</PlatformTabs>
+
+### 3.5 Package Apple artifacts as an xcframework
+
+After building the iOS device, iOS simulator, and macOS artifacts, run:
+
+```bash
+npm run package:apple
+```
+
+The output will be generated at `dist/apple/<project>.xcframework` and `dist/apple/<project>.podspec`.
+
+### 3.6 Avoid symbol conflicts with weak suffix
+
+If the app may contain multiple NAPI providers, enable symbol suffix rewriting so `napi_*` maps to `*_weak`.
+
+- HarmonyOS: enabled by default
+- Other platforms: enable it explicitly in CMake with `-DUSE_WEAK_SUFFIX_NAPI=ON`
+
+```cpp title="src/addon.cc"
+#include <node_api.h>
+#if defined(USE_WEAK_SUFFIX_NAPI)
+#include "weak_napi_defines.h"
+#endif
+
+// ... your addon code ...
+
+#if defined(USE_WEAK_SUFFIX_NAPI)
+#include "weak_napi_undefs.h"
+#endif
+```
+
+:::tip Tooling scope
+The scaffold only generates the project and standardizes the `dist` directory layout. It does not publish AAR, HAR, or Pod packages for you. You still need to package platform artifacts and manage versions in your own release pipeline.
+:::
+
+## 4. Call the addon from BTS
+
+The following is a minimal pattern you can reuse directly. It assumes the host integration described in section 2 is already in place.
+
+:::info BTS / background-only
+`NativeModules` and most business logic usually run on BTS. If you wrap the call inside an event handler or side-effect function, add `'background only'` on the first line when needed.
+:::
+
+### 4.1 Trigger loading
+
+```typescript
+NativeModules.LynxNodeAPI.requireNodeAddon('sample')
+```
+
+### 4.2 Read exports and call them
+
+```typescript
+const exportsTable = (globalThis as any).__lynx_node_addon_exports__
+const sample = exportsTable?.sample
+sample?.hello?.()
+```
+
+### 4.3 Recommended wrapper with errors
+
+```typescript
+function requireAddon<T = any>(name: string): T {
+  'background only';
+
+  const mod = (NativeModules as any)?.LynxNodeAPI
+  if (!mod?.requireNodeAddon) {
+    throw new Error('LynxNodeAPI module is not available. Check host integration and feature flag.')
+  }
+
+  mod.requireNodeAddon(name)
+
+  const exportsTable = (globalThis as any).__lynx_node_addon_exports__
+  const exports = exportsTable?.[name]
+  if (!exports) {
+    throw new Error(`Addon exports not found for ${name}. Check packaging/ABI and napi_register_module_v1 export.`)
+  }
+  return exports as T
+}
+
+const sample = requireAddon<any>('sample')
+sample.hello?.()
+```
+
+:::tip A more Node-like `require` experience
+This sample uses `__lynx_node_addon_exports__` as the export table. If your host app wants something closer to `require("xxx")` in Node.js, you need additional compile-time transforms or a runtime module loader.
+:::
+
+## 5. Troubleshooting
+
+### 5.1 `napi_register_module_v1` cannot be found
+
+- The addon does not export the registration entry using the standard Node-API pattern.
+- Fix: make sure you use standard registration macros such as `NAPI_MODULE_INIT()` or `NAPI_MODULE()`, and do not hide the symbol with visibility settings.
+
+### 5.2 The dynamic library cannot be found at runtime
+
+- The ABI does not match, or the artifact is not packaged.
+- Fix: check whether `jni/<abi>/`, the `har`, or `Frameworks` contains the target library, and verify the host ABI configuration.
+
+### 5.3 iOS loading fails or behaves unexpectedly
+
+- A common reason is that the PrimJS ↔ `LynxWeakNodeAPI` bridge was not installed.
+- Fix: install the bridge during app startup and ensure it runs only once.
+
+### 5.4 Exports are empty
+
+- The loader successfully loads the library, but initialization fails or exports are not published.
+- Fix: check `dlopen`/`dlsym` errors, verify that `napi_env` comes from the correct runtime, and confirm that `__lynx_node_addon_exports__` is written correctly.
+
+---
+
+:::info Security recommendation
+`dlopen` is a sensitive capability. We recommend only allowing packaged resources to be loaded and maintaining an addon allowlist, instead of exposing the loader as a generic entry point for arbitrary paths or library names.
+:::

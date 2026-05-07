@@ -1,0 +1,477 @@
+import { PlatformTabs } from '@lynx';
+
+# Node-API Addon（NAPI Addon）
+
+本文档介绍如何在宿主 App 中接入 Lynx 的 Node-API addon（NAPI addon）能力，包括宿主侧集成、如何开发一个新的 addon，以及前端（BTS）侧如何调用。
+
+:::info 适用范围
+这是一个**实验性能力**。本文以 Lynx/PrimJS 3.9.x 为基线，示例实现遵循开源 Explorer 的默认约定：通过 `requireNodeAddon(addonName)` 触发加载，并将 exports 发布到 `globalThis.__lynx_node_addon_exports__`。
+:::
+
+:::tip 先读这些文档
+- Native Modules 基础概念与 JS ↔ Native 通道：[原生模块](/guide/use-native-modules)
+- Lynx 双线程脚本运行模型（BTS/MTS）：[JavaScript Runtime](/guide/scripting-runtime)
+:::
+
+## 1. 概念与整体链路
+
+在 Lynx 中，Node-API addon 本质上是一个随包分发的动态库（Android/Harmony 为 `.so`，iOS/macOS 为 `.framework/.xcframework`）。宿主 App 在运行时：
+
+1. 从 runtime attach 回调中拿到该页面对应的 `napi_env`。
+2. 在页面调用 `requireNodeAddon(addonName)` 时，宿主侧 loader 通过 `dlopen` 加载动态库，找到并调用 `napi_register_module_v1` 初始化 exports。
+3. 将 exports 发布到 JS 侧（示例约定：`globalThis.__lynx_node_addon_exports__[addonName]`）。
+
+:::info 为什么要绑定 `napi_env`
+`napi_env` 与具体的 JS runtime 实例绑定。跨页面或跨 runtime 复用错误的 env，通常会以崩溃或随机行为的形式暴露。
+:::
+
+## 2. 在宿主 App 中接入（客户端集成）
+
+这一节面向**宿主 App 开发者**。目标是让 Lynx 页面能够在 BTS 中加载并调用 NAPI addon。
+
+### 2.1 前置条件（必须）
+
+- Lynx SDK：3.9.x（或更高且向后兼容的版本）
+- 平台运行时依赖：
+  - Android / Harmony：集成 PrimJS 3.9.x，并确保运行时可用的 `libnapi_adapter.so` 随包携带
+  - iOS：集成 PrimJS 3.9.x，并引入 `LynxWeakNodeAPI`；同时需要在 App 启动阶段安装 PrimJS ↔ `LynxWeakNodeAPI` bridge（一次性）
+
+### 2.2 你需要实现的 3 个拼图
+
+1) **模块边界**：向 Lynx 暴露一个 Native Module（示例模块名：`LynxNodeAPI`），提供 `requireNodeAddon(addonName)` 方法。
+
+2) **env 生命周期绑定**：在 runtime attach 时保存 `napi_env`，在 runtime detach 时清理。
+
+3) **addon loader**：根据 `addonName` 找到动态库，`dlopen` → `dlsym("napi_register_module_v1")` → 初始化 exports → 发布到 JS。
+
+### 2.3 打包 addon 到 App（平台约定）
+
+<PlatformTabs queryKey="platform">
+  <PlatformTabs.Tab platform="android">
+
+在 Android 上，建议将 addon 以 `lib<addon>.so` 的形式随包放入 `jni/<abi>/`。
+
+- Release：将 `jni/<abi>/lib<addon>.so` 封装到一个 AAR 中（宿主只需依赖 AAR）。
+- 本地调试：把 `lib<addon>.so` 放到 `jniLibs.srcDirs` 覆盖的目录中。
+
+:::tip ABI 对齐
+如果你的 addon 只提供了部分 ABI（例如仅 `arm64-v8a`），请确保宿主 App 的 ABI 配置与之对齐，否则会出现“能编译但运行时找不到库”的问题。
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="ios">
+
+在 iOS 上，推荐将 addon 打包为 `xcframework` 并用 CocoaPods `podspec` 集成，这样可以自动完成 link/embed/sign。
+
+:::info iOS 必须的启动期 bridge
+请在 App 启动阶段安装 PrimJS ↔ `LynxWeakNodeAPI` bridge（一次性）。否则即使 addon 已随包，加载也可能失败或行为异常。
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="harmony">
+
+在 HarmonyOS 上，推荐通过 `har` 包携带 addon 的 `lib<addon>.so` 进入应用包。
+
+:::tip 为什么示例使用 Sendable Module
+鸿蒙默认 native module 的执行线程语义与 BTS 不完全一致。Explorer 示例采用 sendable module + token 传递，保证 addon 调用与回调发生在预期线程语义下。
+:::
+
+  </PlatformTabs.Tab>
+</PlatformTabs>
+
+### 2.4 平台集成示例（关键代码）
+
+下面的代码片段仅用于说明关键拼图如何拼起来（注册模块、绑定 `napi_env`、调用 native loader）。你可以按自己 App 的工程结构与编程语言做等价实现。
+
+<PlatformTabs queryKey="platform">
+  <PlatformTabs.Tab platform="android">
+
+#### 注册模块 + 绑定 `napi_env`
+
+```java title="YourApplication.java"
+@Override
+public void onCreate() {
+  super.onCreate();
+  LynxEnv.inst().registerModule("LynxNodeAPI", LynxNodeAPIModule.class);
+}
+```
+
+```java title="LynxPageActivity.java"
+lynxView.addRuntimeLifecycleListener(new RuntimeLifecycleListener() {
+  @Override
+  public void onRuntimeAttach(long napiEnv) {
+    LynxNodeAPIModule.putEnv(lynxView.getLynxContext(), napiEnv);
+  }
+
+  @Override
+  public void onRuntimeDetach() {
+    LynxNodeAPIModule.removeEnv(lynxView.getLynxContext());
+  }
+});
+```
+
+#### 模块方法：转发到 native loader
+
+```java title="LynxNodeAPIModule.java"
+public class LynxNodeAPIModule extends LynxContextModule {
+  static {
+    System.loadLibrary("lynx_napi_addon_loader");
+  }
+
+  @LynxMethod
+  public void requireNodeAddon(String addonName) {
+    long env = getEnv(getLynxContext());
+    nativeRequireNodeAddon(env, addonName);
+  }
+
+  private static native void nativeRequireNodeAddon(long env, String addonName);
+}
+```
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="ios">
+
+#### 启动期安装 bridge（一次性）
+
+```objective-c title="AppDelegate.m"
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+  InstallPrimJSWeakNodeApiBridge();
+  return YES;
+}
+```
+
+#### 绑定 `napi_env`（attach/detach）
+
+```objective-c title="LynxViewController.m"
+BOOL enableNapiAddon = IsTruthyParam(self.params[@"enable_napi_addon"]);
+if (enableNapiAddon) {
+  self.backgroundRuntime = [[LynxBackgroundRuntime alloc] init];
+  [self.backgroundRuntime addRuntimeLifecycleListener:[[LynxNodeAPILifecycleListener alloc] initWithToken:self]];
+  builder.lynxBackgroundRuntime = self.backgroundRuntime;
+}
+
+[builder.config registerModule:LynxNodeAPIModule.class param:self];
+```
+
+#### 模块方法：调用 shared loader
+
+```objective-c title="LynxNodeAPIModule.mm"
++ (NSString *)name { return @"LynxNodeAPI"; }
+
+- (void)requireNodeAddon:(NSString *)addonName {
+  void *napiEnv = [LynxNodeAPIModule envForToken:self.token];
+  lynx::explorer::LynxNodeAPI::GetInstance().RequireNodeAddon(napiEnv, addonName.UTF8String);
+}
+```
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="harmony">
+
+#### Sendable module + token 传递（示例思路）
+
+```typescript title="LynxNodeAPIModule.ets"
+export class LynxNodeAPIModule extends SendableLynxModule {
+  constructor(param?: LynxNodeAPIToken) {
+    super();
+    this.token = param;
+  }
+
+  public requireNodeAddon(addonName: string): void {
+    // 调用 native NAPI glue：requireNodeAddonByToken(token.id, addonName)
+  }
+}
+```
+
+```typescript title="LynxPage.ets"
+if (enableNapiAddon) {
+  this.backgroundRuntime = new LynxBackgroundRuntime();
+  this.backgroundRuntime.addRuntimeLifecycleListener(new LynxNodeAPILifecycleListener(this.nodeAPIToken));
+}
+```
+
+:::info 为什么需要 token
+鸿蒙侧示例将 `napi_env` 与页面 token_id 绑定，并在 native loader 调用时按 token_id 取回对应 env，以满足线程/生命周期语义。
+:::
+
+  </PlatformTabs.Tab>
+</PlatformTabs>
+
+### 2.5 宿主模块接口约定（示例）
+
+JS 侧希望看到一个 `NativeModules.LynxNodeAPI.requireNodeAddon()`：
+
+```typescript title="typings.d.ts"
+declare global {
+  var NativeModules: {
+    LynxNodeAPI?: {
+      requireNodeAddon(addonName: string): void;
+    };
+  };
+}
+```
+
+### 2.6 env 绑定与 loader：推荐实现结构
+
+宿主侧建议拆成两层：
+
+- 平台层（Java/ObjC/ETS）：负责注册模块、拿到 runtime attach/detach 回调、把 `napi_env` 透传到 native。
+- 共享 C/C++ loader：负责 `dlopen/dlsym` 与 exports 发布。
+
+下面给出一个“示例级”的 loader 伪代码（并非唯一实现）：
+
+```cpp title="LynxNodeAPI.cc"
+#include <dlfcn.h>
+#include <node_api.h>
+
+using RegisterFn = napi_value (*)(napi_env env, napi_value exports);
+
+void RequireNodeAddon(void* env_ptr, const char* addon_name) {
+  napi_env env = reinterpret_cast<napi_env>(env_ptr);
+
+  void* handle = dlopen(BuildLibraryName(addon_name), RTLD_NOW);
+  if (!handle) {
+    ThrowOrReport("dlopen failed");
+    return;
+  }
+
+  auto init = reinterpret_cast<RegisterFn>(dlsym(handle, "napi_register_module_v1"));
+  if (!init) {
+    ThrowOrReport("napi_register_module_v1 not found");
+    return;
+  }
+
+  napi_value exports;
+  napi_create_object(env, &exports);
+  exports = init(env, exports);
+
+  PublishToGlobal(env, addon_name, exports); // __lynx_node_addon_exports__[addon_name] = exports
+}
+```
+
+:::info 可定制项
+模块名、方法名、导出表位置、库名解析与搜索路径都属于“宿主定义”。本文档仅描述开源示例的一组默认约定，便于读者快速跑通。
+:::
+
+### 2.7 最小自检清单
+
+- `NativeModules.LynxNodeAPI.requireNodeAddon` 存在且可调用
+- runtime attach 回调已能拿到 `napi_env`，并在 detach 时清理
+- addon 动态库已随包，且 ABI 与宿主配置一致
+- addon 内导出 `napi_register_module_v1`（否则 loader 会失败）
+
+## 3. 开发一个新的 addon（NAPI Addon）
+
+这一节面向 **addon 作者**。推荐使用 `@lynx-js/weak-node-api` 脚手架创建工程，并用 CMake 构建出跨端产物。
+
+### 3.1 环境要求
+
+- Node.js：18+
+- CMake：建议 3.20+
+- Android：安装 NDK，并设置 `ANDROID_NDK` 环境变量
+- HarmonyOS：安装 OHOS NDK，并设置 `OHOS_NDK` 环境变量
+- iOS/macOS：安装 Xcode（用于 `-G Xcode` 与 `xcodebuild`）
+
+### 3.2 创建工程
+
+```bash
+npm exec -y -p @lynx-js/weak-node-api create-weak-node-api
+```
+
+脚手架会生成一个可直接构建的工程，关键文件包括：
+
+- `src/addon.cc`：示例 addon 实现（包含标准注册入口）
+- `CMakeLists.txt`：按平台输出到 `dist/`
+- `scripts/fetch-libs.mjs`：Android/Harmony 下载并抽取 `libnapi_adapter.so`
+- `scripts/package-apple.mjs`：将 Apple 产物打包为 `xcframework` 并生成 `podspec`
+
+### 3.3 编写 addon（确保可被 loader 初始化）
+
+开源示例 loader 会通过 `dlsym` 查找 `napi_register_module_v1` 并调用它初始化 exports。因此 addon 需要使用标准 Node-API 注册宏，确保该符号可见。
+
+```cpp title="src/addon.cc"
+#include <node_api.h>
+
+static napi_value Init(napi_env env, napi_value exports) {
+  // TODO: 给 exports 挂方法/对象
+  return exports;
+}
+
+NAPI_MODULE_INIT() { return Init(env, exports); }
+```
+
+### 3.4 构建与产物（dist/）
+
+构建完成后，产物会按平台输出到 `dist/`：
+
+- Android：`dist/android/<abi>/lib<project>.so`
+- HarmonyOS：`dist/harmony/<abi>/lib<project>.so`
+- iOS：`dist/ios/iphoneos/<project>.framework` 与 `dist/ios/iphonesimulator/<project>.framework`
+- macOS：`dist/macos/macosx/<project>.framework`
+
+<PlatformTabs queryKey="platform">
+  <PlatformTabs.Tab platform="android">
+
+```bash title="build android (arm64-v8a)"
+npm install
+cmake -S . -B build-android-arm64 \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-21 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-android-arm64
+```
+
+:::tip 构建期依赖
+Android 构建会自动执行脚本下载 PrimJS AAR，并从中抽取 `libnapi_adapter.so` 到 `vendor/android/` 参与链接。
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="harmony">
+
+```bash title="build harmony (arm64)"
+npm install
+cmake -S . -B build-ohos-arm64 \
+  -DCMAKE_TOOLCHAIN_FILE=$OHOS_NDK/build/cmake/ohos.toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-ohos-arm64
+```
+
+:::info Harmony 默认开启 weak suffix
+HarmonyOS 默认启用 `USE_WEAK_SUFFIX_NAPI`，并会从 HAR 中抽取 `libnapi_adapter.so` 到 `vendor/harmony/`。
+:::
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="ios">
+
+```bash title="build ios (device slice)"
+npm install
+cmake -S . -B build-ios-arm64 \
+  -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build build-ios-arm64 --config Release
+```
+
+iOS simulator 构建只需将 `-DCMAKE_OSX_SYSROOT` 改为 `iphonesimulator`，并选择合适的 `-DCMAKE_OSX_ARCHITECTURES`。
+
+  </PlatformTabs.Tab>
+  <PlatformTabs.Tab platform="web">
+
+本文档不覆盖 Web 侧 NAPI addon（Web 平台通常不支持 `dlopen`）。
+
+  </PlatformTabs.Tab>
+</PlatformTabs>
+
+### 3.5 Apple 打包为 xcframework（用于 CocoaPods 集成）
+
+在完成 iOS device + iOS simulator + macOS 的构建后，执行：
+
+```bash
+npm run package:apple
+```
+
+产物会生成到：`dist/apple/<project>.xcframework` 与 `dist/apple/<project>.podspec`。
+
+### 3.6 符号冲突规避（weak suffix）
+
+当 App 内可能同时存在多个 NAPI provider 时，建议启用符号后缀重写（把 `napi_*` 映射为 `*_weak`）。
+
+- HarmonyOS：默认开启
+- 其他平台：在配置 CMake 时显式打开：`-DUSE_WEAK_SUFFIX_NAPI=ON`
+
+```cpp title="src/addon.cc"
+#include <node_api.h>
+#if defined(USE_WEAK_SUFFIX_NAPI)
+#include "weak_napi_defines.h"
+#endif
+
+// ... your addon code ...
+
+#if defined(USE_WEAK_SUFFIX_NAPI)
+#include "weak_napi_undefs.h"
+#endif
+```
+
+:::tip 工具链边界
+脚手架只负责“生成工程 + 标准化 dist 目录”，不会替你发布 AAR/HAR/Pod。你需要在自己的 release 流程中完成平台包封装与版本管理。
+:::
+
+## 4. 前端（BTS）调用 addon
+
+下面给出一个“可直接复用”的最小用法。示例假设宿主已按第 2 节接入。
+
+:::info BTS / background-only
+`NativeModules` 与大多数业务逻辑通常在 BTS 执行。若你把调用封装在事件处理或副作用函数里，请按需在函数体第一行加 `'background only'`。
+:::
+
+### 4.1 触发加载
+
+```typescript
+NativeModules.LynxNodeAPI.requireNodeAddon('sample')
+```
+
+### 4.2 读取导出并调用
+
+```typescript
+const exportsTable = (globalThis as any).__lynx_node_addon_exports__
+const sample = exportsTable?.sample
+sample?.hello?.()
+```
+
+### 4.3 推荐封装（带错误提示）
+
+```typescript
+function requireAddon<T = any>(name: string): T {
+  'background only';
+
+  const mod = (NativeModules as any)?.LynxNodeAPI
+  if (!mod?.requireNodeAddon) {
+    throw new Error('LynxNodeAPI module is not available. Check host integration and feature flag.')
+  }
+
+  mod.requireNodeAddon(name)
+
+  const exportsTable = (globalThis as any).__lynx_node_addon_exports__
+  const exports = exportsTable?.[name]
+  if (!exports) {
+    throw new Error(`Addon exports not found for ${name}. Check packaging/ABI and napi_register_module_v1 export.`)
+  }
+  return exports as T
+}
+
+const sample = requireAddon<any>('sample')
+sample.hello?.()
+```
+
+:::tip 更贴近 Node 的 require 体验
+当前示例以 `__lynx_node_addon_exports__` 作为导出表。若你的宿主希望提供更贴近 Node 的 `require("xxx")` 体验，需要额外的编译期改写或运行时 module loader。
+:::
+
+## 5. 常见问题与排查
+
+### 5.1 `napi_register_module_v1` 找不到
+
+- addon 没有按标准 Node-API 方式导出注册入口。
+- 解决：确保使用 `NAPI_MODULE_INIT()` / `NAPI_MODULE()` 等标准注册宏，并避免把符号 visibility 隐藏掉。
+
+### 5.2 运行时找不到动态库
+
+- ABI 不匹配或产物未随包。
+- 解决：检查 `jni/<abi>/` / `har` / `Frameworks` 是否包含目标库，并确认宿主的 ABI 配置。
+
+### 5.3 iOS 加载失败或行为异常
+
+- 常见原因是未安装 PrimJS ↔ `LynxWeakNodeAPI` bridge。
+- 解决：将 bridge 安装放到 App 启动流程中，并确保只执行一次。
+
+### 5.4 exports 为空
+
+- loader 成功加载库，但初始化失败或未发布 exports。
+- 解决：检查 `dlopen/dlsym` 错误、`napi_env` 是否来自正确 runtime，以及是否正确写入 `__lynx_node_addon_exports__`。
+
+---
+
+:::info 安全建议
+`dlopen` 属于敏感能力。建议仅允许加载随包资源并做 addon 白名单，避免把 loader 暴露为“任意路径/任意库名”的通用入口。
+:::
